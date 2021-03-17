@@ -3,8 +3,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <THC/THC.h>
 
-template <typename scalar_t, typename labelscalar_t, typename accscalar_t,
-          typename outscalar_t>
+template <bool SMOOTHING, typename scalar_t, typename labelscalar_t,
+          typename accscalar_t, typename outscalar_t>
 __global__ void focal_loss_forward_cuda_kernel(
     outscalar_t *loss, const scalar_t *__restrict__ cls_output,
     const labelscalar_t *__restrict__ cls_targets_at_level,
@@ -16,8 +16,19 @@ __global__ void focal_loss_forward_cuda_kernel(
   loss_shm[threadIdx.x] = 0;
   accscalar_t loss_acc = 0;
 
-  // Accumulate loss on each thread
   accscalar_t one = accscalar_t(1.0);
+  accscalar_t K = accscalar_t(2.0);
+  accscalar_t nn_norm, np_norm, pn_norm, pp_norm;
+
+  // *_norm is used for label smoothing only
+  if (SMOOTHING) {
+    nn_norm = one - smoothing_factor / K;
+    np_norm = smoothing_factor / K;
+    pn_norm = smoothing_factor - smoothing_factor / K;
+    pp_norm = one - smoothing_factor + smoothing_factor / K;
+  }
+
+  // Accumulate loss on each thread
   for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
        i < num_examples * num_classes; i += gridDim.x * blockDim.x) {
     int64_t idy = i / num_classes;
@@ -27,16 +38,31 @@ __global__ void focal_loss_forward_cuda_kernel(
     if (y == -2)
       continue;
 
-    // Negative matches
+    int64_t pos_idx = idy * num_classes + y;
     scalar_t p = cls_output[i];
     accscalar_t sigma = one / (one + std::exp(-p));
-    accscalar_t loss_t =
-        (one - alpha) * ::pow(sigma, gamma) * ::log(one - sigma);
+    accscalar_t loss_t;
+    if (SMOOTHING) {
+      accscalar_t log_sigma = ::log(sigma);
+      accscalar_t log_om_sigma = ::log(one - sigma);
 
-    // Positive matches
-    int64_t pos_idx = idy * num_classes + y;
-    if (y >= 0 && i == pos_idx) {
-      loss_t = alpha * ::pow(one - sigma, gamma) * ::log(sigma);
+      // Negative matches
+      loss_t = (one - alpha) * ::pow(sigma, gamma) *
+               (nn_norm * log_om_sigma + np_norm * log_sigma);
+
+      // Positive matches
+      if (y >= 0 && i == pos_idx) {
+        loss_t = alpha * ::pow(one - sigma, gamma) *
+                 (pn_norm * log_om_sigma + pp_norm * log_sigma);
+      }
+    } else {
+      // Negative matches
+      loss_t = (one - alpha) * ::pow(sigma, gamma) * ::log(one - sigma);
+
+      // Positive matches
+      if (y >= 0 && i == pos_idx) {
+        loss_t = alpha * ::pow(one - sigma, gamma) * ::log(sigma);
+      }
     }
 
     loss_acc += loss_t;
@@ -60,7 +86,7 @@ __global__ void focal_loss_forward_cuda_kernel(
   }
 }
 
-template <int ILP, typename scalar_t, typename labelscalar_t,
+template <bool SMOOTHING, int ILP, typename scalar_t, typename labelscalar_t,
           typename accscalar_t, typename outscalar_t>
 __global__ void focal_loss_backward_cuda_kernel(
     scalar_t *grad_input, const outscalar_t *__restrict__ grad_output,
@@ -69,11 +95,21 @@ __global__ void focal_loss_backward_cuda_kernel(
     const int64_t num_positives_sum, const int64_t num_examples,
     const int64_t num_classes, const float alpha, const float gamma,
     const float smoothing_factor) {
+  int64_t idx = blockIdx.x * blockDim.x * ILP + threadIdx.x;
   accscalar_t one = accscalar_t(1.0);
+  accscalar_t K = accscalar_t(2.0);
   accscalar_t grad = 0.0;
   accscalar_t normalizer =
       static_cast<accscalar_t>(grad_output[0]) / num_positives_sum;
-  int64_t idx = blockIdx.x * blockDim.x * ILP + threadIdx.x;
+  accscalar_t nn_norm, np_norm, pn_norm, pp_norm;
+
+  // *_norm is used for label smoothing only
+  if (SMOOTHING) {
+    nn_norm = one - smoothing_factor / K;
+    np_norm = smoothing_factor / K;
+    pn_norm = smoothing_factor - smoothing_factor / K;
+    pp_norm = one - smoothing_factor + smoothing_factor / K;
+  }
 
 #pragma unroll(ILP)
   for (int i = 0; i < ILP; i++, idx += blockDim.x) {
@@ -87,17 +123,36 @@ __global__ void focal_loss_backward_cuda_kernel(
       // Ignored matches
       grad = 0.0;
     } else {
-      // Negative matches
+      int64_t pos_idx = idy * num_classes + y;
       scalar_t p = cls_output[idx];
       accscalar_t sigma = one / (one + std::exp(-p));
-      grad = (alpha - one) * ::pow(sigma, gamma) *
-                         (gamma * (one - sigma) * ::log(one - sigma) - sigma);
 
-      // Positive matches
-      int64_t pos_idx = idy * num_classes + y;
-      if (y >= 0 && idx == pos_idx)
-        grad = -alpha * ::pow(one - sigma, gamma) *
-               (one - sigma - gamma * sigma * ::log(sigma));
+      if (SMOOTHING) {
+        accscalar_t log_sigma = ::log(sigma);
+        accscalar_t log_om_sigma = ::log(one - sigma);
+
+        // Negative matches
+        grad = (alpha - one) * ::pow(sigma, gamma) *
+               (gamma * (one - sigma) *
+                    (nn_norm * log_om_sigma + np_norm * log_sigma) +
+                np_norm - sigma);
+
+        // Positive matches
+        if (y >= 0 && idx == pos_idx)
+          grad =
+              -alpha * ::pow(one - sigma, gamma) *
+              (-gamma * sigma * (pn_norm * log_om_sigma + nn_norm * log_sigma) +
+               nn_norm - sigma);
+      } else {
+        // Negative matches
+        grad = (alpha - one) * ::pow(sigma, gamma) *
+               (gamma * (one - sigma) * ::log(one - sigma) - sigma);
+
+        // Positive matches
+        if (y >= 0 && idx == pos_idx)
+          grad = -alpha * ::pow(one - sigma, gamma) *
+                 (one - sigma - gamma * sigma * ::log(sigma));
+      }
     }
 
     grad_input[idx] = grad * normalizer;
@@ -110,10 +165,6 @@ at::Tensor focal_loss_forward_cuda(const at::Tensor &cls_output,
                                    const int64_t num_classes, const float alpha,
                                    const float gamma,
                                    const float smoothing_factor) {
-  // TODO: support label smoothing
-  AT_ASSERTM(smoothing_factor == 0,
-             "Label smoothing is not supported currently.");
-
   AT_ASSERTM(cls_output.numel() % num_classes == 0, "Invalid input shape.");
   AT_ASSERTM(cls_targets_at_level.scalar_type() == at::kLong,
              "Invalid label type.");
@@ -133,19 +184,35 @@ at::Tensor focal_loss_forward_cuda(const at::Tensor &cls_output,
   dim3 grid(2 * props.multiProcessorCount);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      cls_output.scalar_type(), "focal_loss_fprop", [&] {
-        using accscalar_t = at::acc_type<scalar_t, true>;
-        using labelscalar_t = int64_t;
-        using outscalar_t = float;
-        focal_loss_forward_cuda_kernel<scalar_t, labelscalar_t, accscalar_t,
-                                       outscalar_t>
-            <<<grid, block, block.x * sizeof(accscalar_t), stream>>>(
-                loss.data_ptr<outscalar_t>(), cls_output.data_ptr<scalar_t>(),
-                cls_targets_at_level.data_ptr<labelscalar_t>(),
-                num_positives_sum, num_examples, num_classes, alpha, gamma,
-                smoothing_factor);
-      });
+  if (smoothing_factor == 0.0f) {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        cls_output.scalar_type(), "focal_loss_fprop", [&] {
+          using accscalar_t = at::acc_type<scalar_t, true>;
+          using labelscalar_t = int64_t;
+          using outscalar_t = float;
+          focal_loss_forward_cuda_kernel<false, scalar_t, labelscalar_t,
+                                         accscalar_t, outscalar_t>
+              <<<grid, block, block.x * sizeof(accscalar_t), stream>>>(
+                  loss.data_ptr<outscalar_t>(), cls_output.data_ptr<scalar_t>(),
+                  cls_targets_at_level.data_ptr<labelscalar_t>(),
+                  num_positives_sum, num_examples, num_classes, alpha, gamma,
+                  smoothing_factor);
+        });
+  } else {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        cls_output.scalar_type(), "focal_loss_fprop", [&] {
+          using accscalar_t = at::acc_type<scalar_t, true>;
+          using labelscalar_t = int64_t;
+          using outscalar_t = float;
+          focal_loss_forward_cuda_kernel<true, scalar_t, labelscalar_t,
+                                         accscalar_t, outscalar_t>
+              <<<grid, block, block.x * sizeof(accscalar_t), stream>>>(
+                  loss.data_ptr<outscalar_t>(), cls_output.data_ptr<scalar_t>(),
+                  cls_targets_at_level.data_ptr<labelscalar_t>(),
+                  num_positives_sum, num_examples, num_classes, alpha, gamma,
+                  smoothing_factor);
+        });
+  }
 
   THCudaCheck(cudaGetLastError());
   return loss;
@@ -167,21 +234,39 @@ at::Tensor focal_loss_backward_cuda(const at::Tensor &grad_output,
   dim3 grid((cls_output.numel() + block.x * ILP - 1) / (block.x * ILP));
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      cls_output.scalar_type(), "focal_loss_bprop", [&] {
-        using accscalar_t = at::acc_type<scalar_t, true>;
-        using labelscalar_t = int64_t;
-        using outscalar_t = float;
-        focal_loss_backward_cuda_kernel<ILP, scalar_t, labelscalar_t,
-                                        accscalar_t, outscalar_t>
-            <<<grid, block, 0, stream>>>(
-                grad_input.data_ptr<scalar_t>(),
-                grad_output.data_ptr<outscalar_t>(),
-                cls_output.data_ptr<scalar_t>(),
-                cls_targets_at_level.data_ptr<labelscalar_t>(),
-                num_positives_sum, num_examples, num_classes, alpha, gamma,
-                smoothing_factor);
-      });
+  if (smoothing_factor == 0.0f) {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        cls_output.scalar_type(), "focal_loss_bprop", [&] {
+          using accscalar_t = at::acc_type<scalar_t, true>;
+          using labelscalar_t = int64_t;
+          using outscalar_t = float;
+          focal_loss_backward_cuda_kernel<false, ILP, scalar_t, labelscalar_t,
+                                          accscalar_t, outscalar_t>
+              <<<grid, block, 0, stream>>>(
+                  grad_input.data_ptr<scalar_t>(),
+                  grad_output.data_ptr<outscalar_t>(),
+                  cls_output.data_ptr<scalar_t>(),
+                  cls_targets_at_level.data_ptr<labelscalar_t>(),
+                  num_positives_sum, num_examples, num_classes, alpha, gamma,
+                  smoothing_factor);
+        });
+  } else {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        cls_output.scalar_type(), "focal_loss_bprop", [&] {
+          using accscalar_t = at::acc_type<scalar_t, true>;
+          using labelscalar_t = int64_t;
+          using outscalar_t = float;
+          focal_loss_backward_cuda_kernel<true, ILP, scalar_t, labelscalar_t,
+                                          accscalar_t, outscalar_t>
+              <<<grid, block, 0, stream>>>(
+                  grad_input.data_ptr<scalar_t>(),
+                  grad_output.data_ptr<outscalar_t>(),
+                  cls_output.data_ptr<scalar_t>(),
+                  cls_targets_at_level.data_ptr<labelscalar_t>(),
+                  num_positives_sum, num_examples, num_classes, alpha, gamma,
+                  smoothing_factor);
+        });
+  }
 
   THCudaCheck(cudaGetLastError());
   return grad_input;
