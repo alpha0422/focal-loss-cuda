@@ -18,14 +18,12 @@ __global__ void focal_loss_forward_cuda_kernel(
 
   accscalar_t one = accscalar_t(1.0);
   accscalar_t K = accscalar_t(2.0);
-  accscalar_t nn_norm, np_norm, pn_norm, pp_norm;
+  accscalar_t nn_norm, pn_norm;
 
   // *_norm is used for label smoothing only
   if (SMOOTHING) {
     nn_norm = one - smoothing_factor / K;
-    np_norm = smoothing_factor / K;
     pn_norm = smoothing_factor - smoothing_factor / K;
-    pp_norm = one - smoothing_factor + smoothing_factor / K;
   }
 
   // Accumulate loss on each thread
@@ -39,30 +37,19 @@ __global__ void focal_loss_forward_cuda_kernel(
       continue;
 
     int64_t pos_idx = idy * num_classes + y;
-    scalar_t p = cls_output[i];
-    accscalar_t sigma = one / (one + std::exp(-p));
-    accscalar_t loss_t;
-    if (SMOOTHING) {
-      accscalar_t log_sigma = ::log(sigma);
-      accscalar_t log_om_sigma = ::log(one - sigma);
+    accscalar_t p = static_cast<accscalar_t>(cls_output[i]);
+    accscalar_t sigma = one / (one + ::exp(-p));
+    accscalar_t m = ::max(-p, static_cast<accscalar_t>(0));
+    accscalar_t off = m + ::log(::exp(-m) + ::exp(-p - m));
 
-      // Negative matches
-      loss_t = (one - alpha) * ::pow(sigma, gamma) *
-               (nn_norm * log_om_sigma + np_norm * log_sigma);
+    // Negative matches
+    accscalar_t base = SMOOTHING ? nn_norm * p : p;
+    accscalar_t loss_t = (one - alpha) * ::pow(sigma, gamma) * (base + off);
 
-      // Positive matches
-      if (y >= 0 && i == pos_idx) {
-        loss_t = alpha * ::pow(one - sigma, gamma) *
-                 (pn_norm * log_om_sigma + pp_norm * log_sigma);
-      }
-    } else {
-      // Negative matches
-      loss_t = (one - alpha) * ::pow(sigma, gamma) * ::log(one - sigma);
-
-      // Positive matches
-      if (y >= 0 && i == pos_idx) {
-        loss_t = alpha * ::pow(one - sigma, gamma) * ::log(sigma);
-      }
+    // Positive matches
+    if (y >= 0 && i == pos_idx) {
+      base = SMOOTHING ? pn_norm * p : 0;
+      loss_t = alpha * ::pow(one - sigma, gamma) * (base + off);
     }
 
     loss_acc += loss_t;
@@ -81,7 +68,7 @@ __global__ void focal_loss_forward_cuda_kernel(
   // Inter-CTA reduction
   if (threadIdx.x == 0) {
     // Normalize and keep sign
-    loss_acc = loss_shm[0] * -one / num_positives_sum;
+    loss_acc = loss_shm[0] / num_positives_sum;
     atomicAdd(loss, loss_acc);
   }
 }
@@ -124,34 +111,23 @@ __global__ void focal_loss_backward_cuda_kernel(
       grad = 0.0;
     } else {
       int64_t pos_idx = idy * num_classes + y;
-      scalar_t p = cls_output[idx];
-      accscalar_t sigma = one / (one + std::exp(-p));
+      accscalar_t p = static_cast<accscalar_t>(cls_output[idx]);
+      accscalar_t sigma = one / (one + ::exp(-p));
+      accscalar_t m = ::max(-p, static_cast<accscalar_t>(0));
+      accscalar_t off_a = m + ::log(::exp(-m) + ::exp(-p - m));
 
-      if (SMOOTHING) {
-        accscalar_t log_sigma = ::log(sigma);
-        accscalar_t log_om_sigma = ::log(one - sigma);
+      // Negative matches
+      accscalar_t base = SMOOTHING ? nn_norm * p : p;
+      accscalar_t off_b = SMOOTHING ? np_norm : 0;
+      grad = (one - alpha) * ::pow(sigma, gamma) *
+             (gamma * (one - sigma) * (base + off_a) + sigma - off_b);
 
-        // Negative matches
-        grad = (alpha - one) * ::pow(sigma, gamma) *
-               (gamma * (one - sigma) *
-                    (nn_norm * log_om_sigma + np_norm * log_sigma) +
-                np_norm - sigma);
-
-        // Positive matches
-        if (y >= 0 && idx == pos_idx)
-          grad =
-              -alpha * ::pow(one - sigma, gamma) *
-              (-gamma * sigma * (pn_norm * log_om_sigma + nn_norm * log_sigma) +
-               nn_norm - sigma);
-      } else {
-        // Negative matches
-        grad = (alpha - one) * ::pow(sigma, gamma) *
-               (gamma * (one - sigma) * ::log(one - sigma) - sigma);
-
-        // Positive matches
-        if (y >= 0 && idx == pos_idx)
-          grad = -alpha * ::pow(one - sigma, gamma) *
-                 (one - sigma - gamma * sigma * ::log(sigma));
+      // Positive matches
+      if (y >= 0 && idx == pos_idx) {
+        base = SMOOTHING ? pn_norm * p : 0;
+        off_b = SMOOTHING ? pp_norm : 1;
+        grad = alpha * ::pow(one - sigma, gamma) *
+               (-gamma * sigma * (base + off_a) + sigma - off_b);
       }
     }
 
