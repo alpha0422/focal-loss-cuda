@@ -55,7 +55,7 @@ setup(
         ],
             extra_compile_args={
             'cxx': ['-O3', ],
-            'nvcc':['-O3', '-lineinfo', '-res-usage']
+            'nvcc':['-O3', '-lineinfo', '-res-usage', '--use_fast_math']
         })
     ],
     cmdclass={
