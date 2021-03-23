@@ -9,35 +9,21 @@ class FocalLoss(torch.autograd.Function):
         if isinstance(num_positives_sum, torch.Tensor):
             num_positives_sum = num_positives_sum.item()
         num_positives_sum = int(num_positives_sum)
-        loss = focal_loss_cuda.forward(cls_output,
-                                       cls_targets_at_level,
-                                       num_positives_sum,
-                                       num_classes, alpha, gamma,
-                                       label_smoothing)
+        loss, partial_grad = focal_loss_cuda.forward(cls_output,
+                                                     cls_targets_at_level,
+                                                     num_positives_sum,
+                                                     num_classes, alpha, gamma,
+                                                     label_smoothing)
 
-        ctx.save_for_backward(cls_output, cls_targets_at_level,
-                              torch.IntTensor([num_positives_sum]),
-                              torch.IntTensor([num_classes]),
-                              torch.FloatTensor([alpha]),
-                              torch.FloatTensor([gamma]),
-                              torch.FloatTensor([label_smoothing]))
+        ctx.save_for_backward(partial_grad)
         return loss
 
     @staticmethod
     def backward(ctx, grad_loss):
-        cls_output, cls_targets_at_level, num_positives_sum, num_classes, \
-            alpha, gamma, label_smoothing = ctx.saved_tensors
-        num_positives_sum = num_positives_sum.item()
-        num_classes = num_classes.item()
-        alpha = alpha.item()
-        gamma = gamma.item()
-        label_smoothing = label_smoothing.item()
+        partial_grad, = ctx.saved_tensors
 
-        grad_input = focal_loss_cuda.backward(grad_loss,
-                                              cls_output,
-                                              cls_targets_at_level,
-                                              num_positives_sum,
-                                              num_classes, alpha, gamma,
-                                              label_smoothing)
+        # The backward kernel is actually in-place to save memory space, partial_grad
+        # and grad_input are the same tensor.
+        grad_input = focal_loss_cuda.backward(grad_loss, partial_grad)
 
         return grad_input, None, None, None, None, None, None

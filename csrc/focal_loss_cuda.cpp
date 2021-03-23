@@ -4,20 +4,13 @@
 
 // CUDA forward declarations
 
-at::Tensor focal_loss_forward_cuda(const at::Tensor &cls_output,
-                                   const at::Tensor &cls_targets_at_level,
-                                   const int64_t num_positives_sum,
-                                   const int64_t num_classes, const float alpha,
-                                   const float gamma,
-                                   const float smoothing_factor);
+std::vector<at::Tensor> focal_loss_forward_cuda(
+    const at::Tensor &cls_output, const at::Tensor &cls_targets_at_level,
+    const int64_t num_positives_sum, const int64_t num_classes,
+    const float alpha, const float gamma, const float smoothing_factor);
 
 at::Tensor focal_loss_backward_cuda(const at::Tensor &grad_output,
-                                    const at::Tensor &cls_output,
-                                    const at::Tensor &cls_targets_at_level,
-                                    const int64_t num_positives_sum,
-                                    const int64_t num_classes,
-                                    const float alpha, const float gamma,
-                                    const float smoothing_factor);
+                                    const at::Tensor &partial_grad);
 
 // C++ interface
 
@@ -28,11 +21,10 @@ at::Tensor focal_loss_backward_cuda(const at::Tensor &grad_output,
   CHECK_CUDA(x);                                                               \
   CHECK_CONTIGUOUS(x)
 
-at::Tensor focal_loss_forward(const at::Tensor &cls_output,
-                              const at::Tensor &cls_targets_at_level,
-                              const int64_t num_positives_sum,
-                              const int64_t num_classes, const float alpha,
-                              const float gamma, const float smoothing_factor) {
+std::vector<at::Tensor> focal_loss_forward(
+    const at::Tensor &cls_output, const at::Tensor &cls_targets_at_level,
+    const int64_t num_positives_sum, const int64_t num_classes,
+    const float alpha, const float gamma, const float smoothing_factor) {
   CHECK_INPUT(cls_output);
   CHECK_INPUT(cls_targets_at_level);
 
@@ -42,19 +34,11 @@ at::Tensor focal_loss_forward(const at::Tensor &cls_output,
 }
 
 at::Tensor focal_loss_backward(const at::Tensor &grad_output,
-                               const at::Tensor &cls_output,
-                               const at::Tensor &cls_targets_at_level,
-                               const int64_t num_positives_sum,
-                               const int64_t num_classes, const float alpha,
-                               const float gamma,
-                               const float smoothing_factor) {
+                               const at::Tensor &partial_grad) {
   CHECK_INPUT(grad_output);
-  CHECK_INPUT(cls_output);
-  CHECK_INPUT(cls_targets_at_level);
+  CHECK_INPUT(partial_grad);
 
-  return focal_loss_backward_cuda(grad_output, cls_output, cls_targets_at_level,
-                                  num_positives_sum, num_classes, alpha, gamma,
-                                  smoothing_factor);
+  return focal_loss_backward_cuda(grad_output, partial_grad);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
