@@ -46,13 +46,18 @@ __global__ void focal_loss_forward_cuda_kernel(
     labelscalar_t y = cls_targets_at_level[idy];
     int64_t base_yid = i % num_classes;
 
-    // Skip ignored matches
-    // TODO: notice partial grad is empty
-    if (y == -2)
-      continue;
-
     int64_t pos_idx = idy * num_classes + y;
     p_vec = *(uint4 *)&cls_output[i];
+
+    // Skip ignored matches
+    if (y == -2) {
+#pragma unroll
+      for (int j = 0; j < ILP; j++) {
+        *((scalar_t *)(&grad_vec) + j) = 0;
+      }
+      *(uint4 *)&partial_grad[i] = grad_vec;
+      continue;
+    }
 
 #pragma unroll
     for (int j = 0; j < ILP; j++) {
