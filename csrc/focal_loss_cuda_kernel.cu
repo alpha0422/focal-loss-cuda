@@ -27,6 +27,7 @@ __global__ void focal_loss_forward_cuda_kernel(
 
   accscalar_t one = accscalar_t(1.0);
   accscalar_t K = accscalar_t(2.0);
+  accscalar_t normalizer = one / static_cast<accscalar_t>(num_positives_sum);
   accscalar_t nn_norm, np_norm, pn_norm, pp_norm;
 
   // *_norm is used for label smoothing only
@@ -68,30 +69,39 @@ __global__ void focal_loss_forward_cuda_kernel(
       }
 
       accscalar_t p = static_cast<accscalar_t>(*((scalar_t *)(&p_vec) + j));
-      accscalar_t sigma = one / (one + ::exp(-p));
-      accscalar_t m = ::max(-p, static_cast<accscalar_t>(0));
-      accscalar_t off_a = m + ::log(::exp(-m) + ::exp(-p - m));
+      accscalar_t exp_np = ::exp(-p);
+      accscalar_t exp_pp = ::exp(p);
+      accscalar_t sigma = one / (one + exp_np);
+      accscalar_t logee = (p >= 0) ? exp_np : exp_pp;
+      accscalar_t addee = (p >= 0) ? 0 : -p;
+      accscalar_t off_a = addee + ::log(one + logee);
 
       // Negative matches
       accscalar_t base = SMOOTHING ? nn_norm * p : p;
       accscalar_t off_b = (SMOOTHING ? np_norm : 0) - sigma;
-      accscalar_t coeff_f = (one - alpha) * ::pow(sigma, gamma);
-      accscalar_t coeff_b = gamma * (one - sigma);
+      accscalar_t coeff_f1 = one - alpha;
+      accscalar_t coeff_f2 = sigma;
+      accscalar_t coeff_b1 = gamma;
+      accscalar_t coeff_b2 = one - sigma;
 
       // Positive matches
       if (y >= 0 && (i + j == pos_idx)) {
         base = SMOOTHING ? pn_norm * p : 0;
-        off_b = (SMOOTHING ? pp_norm : 1) - sigma;
-        coeff_f = alpha * ::pow(one - sigma, gamma);
-        coeff_b = -gamma * sigma;
+        off_b = (SMOOTHING ? pp_norm : one) - sigma;
+        coeff_f1 = alpha;
+        coeff_f2 = one - sigma;
+        coeff_b1 = -gamma;
+        coeff_b2 = sigma;
       }
+
+      accscalar_t coeff_f = coeff_f1 * ::pow(coeff_f2, gamma);
+      accscalar_t coeff_b = coeff_b1 * coeff_b2;
 
       accscalar_t loss_t = coeff_f * (base + off_a);
       accscalar_t grad = coeff_f * (coeff_b * (base + off_a) - off_b);
 
       loss_acc += loss_t;
-      *((scalar_t *)(&grad_vec) + j) =
-          static_cast<scalar_t>(grad / num_positives_sum);
+      *((scalar_t *)(&grad_vec) + j) = static_cast<scalar_t>(grad * normalizer);
     }
 
     // This can't ensure to generate stg.128 and may be two stg.64.
@@ -110,7 +120,7 @@ __global__ void focal_loss_forward_cuda_kernel(
 
   // Inter-CTA reduction
   if (threadIdx.x == 0) {
-    loss_acc = loss_shm[0] / num_positives_sum;
+    loss_acc = loss_shm[0] * normalizer;
     atomicAdd(loss, loss_acc);
   }
 }
