@@ -17,7 +17,7 @@ __global__ void focal_loss_forward_cuda_kernel(
     outscalar_t *loss, scalar_t *partial_grad,
     const scalar_t *__restrict__ cls_output,
     const labelscalar_t *__restrict__ cls_targets_at_level,
-    const int64_t num_positives_sum, const int64_t num_examples,
+    const float *__restrict__ num_positives_sum, const int64_t num_examples,
     const int64_t num_classes, const int64_t num_real_classes,
     const float alpha, const float gamma, const float smoothing_factor) {
   extern __shared__ unsigned char shm[];
@@ -27,7 +27,7 @@ __global__ void focal_loss_forward_cuda_kernel(
 
   accscalar_t one = accscalar_t(1.0);
   accscalar_t K = accscalar_t(2.0);
-  accscalar_t normalizer = one / static_cast<accscalar_t>(num_positives_sum);
+  accscalar_t normalizer = one / static_cast<accscalar_t>(num_positives_sum[0]);
   accscalar_t nn_norm, np_norm, pn_norm, pp_norm;
 
   // *_norm is used for label smoothing only
@@ -152,16 +152,17 @@ focal_loss_backward_cuda_kernel(scalar_t *partial_grad,
 
 std::vector<at::Tensor> focal_loss_forward_cuda(
     const at::Tensor &cls_output, const at::Tensor &cls_targets_at_level,
-    const int64_t num_positives_sum, const int64_t num_real_classes,
+    const at::Tensor &num_positives_sum, const int64_t num_real_classes,
     const float alpha, const float gamma, const float smoothing_factor) {
   // Checks required for correctness
   AT_ASSERTM(cls_output.size(-1) >= num_real_classes,
              "Incorrect number of real classes.");
   AT_ASSERTM(cls_targets_at_level.scalar_type() == at::kLong,
              "Invalid label type.");
-  AT_ASSERTM(num_positives_sum > 0,
-             "Expect more than one positive matches, user should increase "
-             "total matches by one.");
+  AT_ASSERTM(
+      (num_positives_sum.numel() == 1) &&
+          (num_positives_sum.scalar_type() == at::kFloat),
+      "Expect num_positives_sum to be a float32 tensor with only one element.");
   AT_ASSERTM(cls_output.dim() == cls_targets_at_level.dim() + 1,
              "Mis-matched dimensions between class output and label.");
   for (int64_t i = 0; i < cls_targets_at_level.dim(); i++)
@@ -207,8 +208,9 @@ std::vector<at::Tensor> focal_loss_forward_cuda(
                   partial_grad.data_ptr<scalar_t>(),
                   cls_output.data_ptr<scalar_t>(),
                   cls_targets_at_level.data_ptr<labelscalar_t>(),
-                  num_positives_sum, num_examples, num_classes,
-                  num_real_classes, alpha, gamma, smoothing_factor);
+                  num_positives_sum.data_ptr<float>(), num_examples,
+                  num_classes, num_real_classes, alpha, gamma,
+                  smoothing_factor);
         });
   } else {
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
@@ -224,8 +226,9 @@ std::vector<at::Tensor> focal_loss_forward_cuda(
                   partial_grad.data_ptr<scalar_t>(),
                   cls_output.data_ptr<scalar_t>(),
                   cls_targets_at_level.data_ptr<labelscalar_t>(),
-                  num_positives_sum, num_examples, num_classes,
-                  num_real_classes, alpha, gamma, smoothing_factor);
+                  num_positives_sum.data_ptr<float>(), num_examples,
+                  num_classes, num_real_classes, alpha, gamma,
+                  smoothing_factor);
         });
   }
 
