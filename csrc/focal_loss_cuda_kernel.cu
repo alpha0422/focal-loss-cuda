@@ -154,15 +154,8 @@ std::vector<at::Tensor> focal_loss_forward_cuda(
     const at::Tensor &cls_output, const at::Tensor &cls_targets_at_level,
     const int64_t num_positives_sum, const int64_t num_real_classes,
     const float alpha, const float gamma, const float smoothing_factor) {
-  // The data is enforced to be NHWC layout physically, but can be either
-  // PyTorch contiguous format or channels_last format.
-  int64_t num_classes = cls_output.is_contiguous(at::MemoryFormat::ChannelsLast)
-                            ? cls_output.stride(-1)
-                            : cls_output.size(-1);
-  int64_t num_examples = cls_output.numel() / num_classes;
-
   // Checks required for correctness
-  AT_ASSERTM(num_classes >= num_real_classes,
+  AT_ASSERTM(cls_output.size(-1) >= num_real_classes,
              "Incorrect number of real classes.");
   AT_ASSERTM(cls_targets_at_level.scalar_type() == at::kLong,
              "Invalid label type.");
@@ -178,10 +171,12 @@ std::vector<at::Tensor> focal_loss_forward_cuda(
   // Checks required for better performance
   const int ILP = sizeof(uint4) / cls_output.element_size();
   ASSERT_UINT4_ALIGNED(cls_output.data_ptr());
-  AT_ASSERTM(num_classes % ILP == 0,
+  AT_ASSERTM(cls_output.size(-1) % ILP == 0,
              "Pad number of classes first to take advantage of 128 bit load.");
   AT_ASSERTM(num_real_classes >= ILP, "Too few classes.");
 
+  int64_t num_classes = cls_output.size(-1);
+  int64_t num_examples = cls_output.numel() / num_classes;
   at::Tensor loss = at::zeros({}, cls_output.options().dtype(at::kFloat));
 
   // Compute the incompelete gradient during fprop since most of the heavy
