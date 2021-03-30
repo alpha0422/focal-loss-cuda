@@ -13,15 +13,16 @@ class FocalLoss(torch.autograd.Function):
                                                      alpha, gamma,
                                                      label_smoothing)
 
-        ctx.save_for_backward(partial_grad)
+        ctx.save_for_backward(partial_grad, num_positives_sum)
         return loss
 
     @staticmethod
     def backward(ctx, grad_loss):
-        partial_grad, = ctx.saved_tensors
+        partial_grad, num_positives_sum = ctx.saved_tensors
 
-        # The backward kernel is actually in-place to save memory space, partial_grad
-        # and grad_input are the same tensor.
-        grad_input = focal_loss_cuda.backward(grad_loss, partial_grad)
+        # The backward kernel is actually in-place to save memory space,
+        # partial_grad and grad_input are the same tensor.
+        grad_input = focal_loss_cuda.backward(grad_loss, partial_grad,
+                                              num_positives_sum)
 
         return grad_input, None, None, None, None, None, None

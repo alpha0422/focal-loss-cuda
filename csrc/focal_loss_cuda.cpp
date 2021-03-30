@@ -10,7 +10,8 @@ std::vector<at::Tensor> focal_loss_forward_cuda(
     const float alpha, const float gamma, const float smoothing_factor);
 
 at::Tensor focal_loss_backward_cuda(const at::Tensor &grad_output,
-                                    const at::Tensor &partial_grad);
+                                    const at::Tensor &partial_grad,
+                                    const at::Tensor &num_positives_sum);
 
 // C++ interface
 
@@ -35,11 +36,12 @@ std::vector<at::Tensor> focal_loss_forward(
 }
 
 at::Tensor focal_loss_backward(const at::Tensor &grad_output,
-                               const at::Tensor &partial_grad) {
+                               const at::Tensor &partial_grad,
+                               const at::Tensor &num_positives_sum) {
   CHECK_INPUT(grad_output);
   CHECK_INPUT(partial_grad);
 
-  return focal_loss_backward_cuda(grad_output, partial_grad);
+  return focal_loss_backward_cuda(grad_output, partial_grad, num_positives_sum);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

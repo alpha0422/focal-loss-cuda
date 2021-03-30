@@ -100,8 +100,12 @@ __global__ void focal_loss_forward_cuda_kernel(
       accscalar_t loss_t = coeff_f * (base + off_a);
       accscalar_t grad = coeff_f * (coeff_b * (base + off_a) - off_b);
 
+      // Delay the normalize of partial gradient by num_positives_sum to back
+      // propagation because scalar_t reduces precision. Focal loss is very
+      // sensitive to the small gradient. No worry on overflow here since
+      // gradient has relative smaller range than input.
       loss_acc += loss_t;
-      *((scalar_t *)(&grad_vec) + j) = static_cast<scalar_t>(grad * normalizer);
+      *((scalar_t *)(&grad_vec) + j) = static_cast<scalar_t>(grad);
     }
 
     // This can't ensure to generate stg.128 and may be two stg.64.
@@ -130,9 +134,12 @@ template <int ILP, typename scalar_t, typename accscalar_t,
 __global__ void
 focal_loss_backward_cuda_kernel(scalar_t *partial_grad,
                                 const outscalar_t *__restrict__ grad_output,
+                                const float *__restrict__ num_positives_sum,
                                 const uint64_t numel) {
   int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * ILP;
-  accscalar_t normalizer = static_cast<accscalar_t>(grad_output[0]);
+
+  accscalar_t one = accscalar_t(1.0);
+  accscalar_t normalizer = static_cast<accscalar_t>(grad_output[0]) / static_cast<accscalar_t>(num_positives_sum[0]);
 
   // The input is enforced to pad to use vector load, thus there's no need to
   // check whether the last element of ILP can out of bound.
@@ -237,7 +244,8 @@ std::vector<at::Tensor> focal_loss_forward_cuda(
 }
 
 at::Tensor focal_loss_backward_cuda(const at::Tensor &grad_output,
-                                    const at::Tensor &partial_grad) {
+                                    const at::Tensor &partial_grad,
+                                    const at::Tensor &num_positives_sum) {
   // Each thread process ILP elements
   const int ILP = sizeof(uint4) / partial_grad.element_size();
   dim3 block(512);
@@ -252,6 +260,7 @@ at::Tensor focal_loss_backward_cuda(const at::Tensor &grad_output,
         focal_loss_backward_cuda_kernel<ILP, scalar_t, accscalar_t, outscalar_t>
             <<<grid, block, 0, stream>>>(partial_grad.data_ptr<scalar_t>(),
                                          grad_output.data_ptr<outscalar_t>(),
+                                         num_positives_sum.data_ptr<float>(),
                                          partial_grad.numel());
       });
 
