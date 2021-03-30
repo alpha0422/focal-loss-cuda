@@ -131,15 +131,14 @@ __global__ void focal_loss_forward_cuda_kernel(
 
 template <int ILP, typename scalar_t, typename accscalar_t,
           typename outscalar_t>
-__global__ void
-focal_loss_backward_cuda_kernel(scalar_t *partial_grad,
-                                const outscalar_t *__restrict__ grad_output,
-                                const float *__restrict__ num_positives_sum,
-                                const uint64_t numel) {
+__global__ void focal_loss_backward_cuda_kernel(
+    scalar_t *partial_grad, const outscalar_t *__restrict__ grad_output,
+    const float *__restrict__ num_positives_sum, const uint64_t numel) {
   int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * ILP;
 
   accscalar_t one = accscalar_t(1.0);
-  accscalar_t normalizer = static_cast<accscalar_t>(grad_output[0]) / static_cast<accscalar_t>(num_positives_sum[0]);
+  accscalar_t normalizer = static_cast<accscalar_t>(grad_output[0]) /
+                           static_cast<accscalar_t>(num_positives_sum[0]);
 
   // The input is enforced to pad to use vector load, thus there's no need to
   // check whether the last element of ILP can out of bound.
