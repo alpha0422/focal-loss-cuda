@@ -136,7 +136,6 @@ __global__ void focal_loss_backward_cuda_kernel(
     const float *__restrict__ num_positives_sum, const uint64_t numel) {
   int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * ILP;
 
-  accscalar_t one = accscalar_t(1.0);
   accscalar_t normalizer = static_cast<accscalar_t>(grad_output[0]) /
                            static_cast<accscalar_t>(num_positives_sum[0]);
 
