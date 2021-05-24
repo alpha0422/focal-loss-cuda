@@ -3,6 +3,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <THC/THC.h>
 
+thread_local int multiProcessorCount=0;
+
 #define ASSERT_UINT4_ALIGNED(PTR)                                              \
   AT_ASSERTM(is_aligned<uint4>(PTR), "Tensor " #PTR " is not uint4 aligned")
 
@@ -192,10 +194,13 @@ std::vector<at::Tensor> focal_loss_forward_cuda(
 
   // The grid contains 2 CTA per SM, each CTA loop on input with stride till the
   // last item.
-  cudaDeviceProp props;
-  cudaGetDeviceProperties(&props, at::cuda::current_device());
+  if (multiProcessorCount == 0) {
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, at::cuda::current_device());
+    multiProcessorCount = props.multiProcessorCount;
+  }
   dim3 block(512);
-  dim3 grid(2 * props.multiProcessorCount);
+  dim3 grid(2 * multiProcessorCount);
 
   // Specialize on label smoothing or not to reduce redundant operations
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
