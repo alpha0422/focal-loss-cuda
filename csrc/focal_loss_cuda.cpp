@@ -13,6 +13,14 @@ at::Tensor focal_loss_backward_cuda(const at::Tensor &grad_output,
                                     const at::Tensor &partial_grad,
                                     const at::Tensor &num_positives_sum);
 
+std::vector<at::Tensor> focal_bce_loss_forward_cuda(const at::Tensor &y_pred,
+                                                    const at::Tensor &y_true,
+                                                    const float alpha,
+                                                    const float gamma);
+
+at::Tensor focal_bce_loss_backward_cuda(const at::Tensor &grad_output,
+                                        const at::Tensor &partial_grad);
+
 // C++ interface
 
 #define CHECK_CUDA(x) AT_ASSERTM(x.is_cuda(), #x " must be a CUDA tensor")
@@ -44,9 +52,31 @@ at::Tensor focal_loss_backward(const at::Tensor &grad_output,
   return focal_loss_backward_cuda(grad_output, partial_grad, num_positives_sum);
 }
 
+std::vector<at::Tensor> focal_bce_loss_forward(const at::Tensor &y_pred,
+                                               const at::Tensor &y_true,
+                                               const float alpha,
+                                               const float gamma) {
+  CHECK_INPUT(y_pred);
+  CHECK_INPUT(y_true);
+
+  return focal_bce_loss_forward_cuda(y_pred, y_true, alpha, gamma);
+}
+
+at::Tensor focal_bce_loss_backward(const at::Tensor &grad_output,
+                                   const at::Tensor &partial_grad) {
+  CHECK_INPUT(grad_output);
+  CHECK_INPUT(partial_grad);
+
+  return focal_bce_loss_backward_cuda(grad_output, partial_grad);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &focal_loss_forward,
         "Focal loss calculation forward (CUDA)");
   m.def("backward", &focal_loss_backward,
-        "Focal loss calculation backward (CUDA)");
+        "Focal BCE loss calculation backward (CUDA)");
+  m.def("bce_forward", &focal_bce_loss_forward,
+        "Focal loss calculation forward (CUDA)");
+  m.def("bce_backward", &focal_bce_loss_backward,
+        "Focal BCE loss calculation backward (CUDA)");
 }

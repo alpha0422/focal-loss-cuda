@@ -3,7 +3,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
-thread_local int multiProcessorCount=0;
+thread_local int multiProcessorCount = 0;
 
 #define ASSERT_UINT4_ALIGNED(PTR)                                              \
   AT_ASSERTM(is_aligned<uint4>(PTR), "Tensor " #PTR " is not uint4 aligned")
@@ -264,6 +264,150 @@ at::Tensor focal_loss_backward_cuda(const at::Tensor &grad_output,
             <<<grid, block, 0, stream>>>(partial_grad.data_ptr<scalar_t>(),
                                          grad_output.data_ptr<outscalar_t>(),
                                          num_positives_sum.data_ptr<float>(),
+                                         partial_grad.numel());
+      });
+
+  C10_CUDA_CHECK(cudaGetLastError());
+  return partial_grad;
+}
+
+template <int ILP, typename scalar_t, typename labelscalar_t,
+          typename accscalar_t, typename outscalar_t>
+__global__ void
+focal_bce_loss_forward_cuda_kernel(outscalar_t *loss, outscalar_t *partial_grad,
+                                   const scalar_t *__restrict__ y_pred,
+                                   const labelscalar_t *__restrict__ y_true,
+                                   const int64_t numel, const float alpha,
+                                   const float gamma) {
+  accscalar_t one = accscalar_t(1.0);
+  accscalar_t nn_norm, np_norm, pn_norm, pp_norm;
+
+  int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * ILP;
+#pragma unroll
+  for (int64_t i = 0; (i < ILP) && (idx + i < numel); i++) {
+    accscalar_t p = static_cast<accscalar_t>(y_pred[idx + i]);
+    labelscalar_t y = y_true[idx + i];
+
+    // Use max(-p, 0) trick for numerical stability
+    accscalar_t exp_np = ::exp(-p);
+    accscalar_t exp_pp = ::exp(p);
+    accscalar_t sigma = one / (one + exp_np);
+    accscalar_t logee = (p >= 0) ? exp_np : exp_pp;
+    accscalar_t addee = (p >= 0) ? 0 : -p;
+    accscalar_t off_a = addee + ::log(one + logee);
+
+    // Negative match, y is zero
+    accscalar_t base = p;
+    accscalar_t off_b = -sigma;
+    accscalar_t coeff_f1 = one - alpha;
+    accscalar_t coeff_f2 = sigma;
+    accscalar_t coeff_b1 = gamma;
+    accscalar_t coeff_b2 = one - sigma;
+
+    // Positive match, y is one
+    if (y == one) {
+      base = 0;
+      off_b = one - sigma;
+      coeff_f1 = alpha;
+      coeff_f2 = one - sigma;
+      coeff_b1 = -gamma;
+      coeff_b2 = sigma;
+    }
+
+    accscalar_t coeff_f = coeff_f1 * ::pow(coeff_f2, gamma);
+    accscalar_t coeff_b = coeff_b1 * coeff_b2;
+
+    accscalar_t loss_t = coeff_f * (base + off_a);
+    accscalar_t grad = coeff_f * (coeff_b * (base + off_a) - off_b);
+
+    loss[idx + i] = loss_t;
+    partial_grad[idx + i] = grad;
+  }
+}
+
+template <int ILP, typename scalar_t, typename accscalar_t,
+          typename outscalar_t>
+__global__ void
+focal_bce_loss_backward_cuda_kernel(outscalar_t *partial_grad,
+                                    const outscalar_t *__restrict__ grad_output,
+                                    const uint64_t numel) {
+  int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * ILP;
+
+#pragma unroll(ILP)
+  for (int i = 0; (i < ILP) && (idx + i < numel); i++) {
+    auto grad = static_cast<accscalar_t>(partial_grad[idx + i]);
+    auto loss = static_cast<accscalar_t>(grad_output[idx + i]);
+    partial_grad[idx + i] = grad * loss;
+  }
+}
+
+std::vector<at::Tensor> focal_bce_loss_forward_cuda(const at::Tensor &y_pred,
+                                                    const at::Tensor &y_true,
+                                                    const float alpha,
+                                                    const float gamma) {
+  // Checks required for correctness
+  AT_ASSERTM(y_true.scalar_type() == at::kFloat,
+             "Expect label type as float32.");
+  AT_ASSERTM(y_pred.numel() == y_true.numel(),
+             "Expect same number of elements for y_pred and y_true.");
+  AT_ASSERTM(y_pred.dim() == y_true.dim(),
+             "Mis-matched dimensions between y_pred and y_true.");
+  for (int64_t i = 0; i < y_true.dim(); i++)
+    AT_ASSERTM(y_pred.size(i) == y_true.size(i),
+               "Shape mis-match between y_pred and y_true.");
+
+  int64_t numel = y_pred.numel();
+  at::Tensor loss = at::zeros_like(y_pred, y_pred.options().dtype(at::kFloat));
+
+  // Compute the incompelete gradient during fprop since most of the heavy
+  // functions of bprop are the same as fprop, thus trade memory for compute
+  // helps with focal loss.
+  at::Tensor partial_grad =
+      at::empty_like(y_pred, y_pred.options().dtype(at::kFloat));
+
+  // Each thread process ILP elements.
+  const int ILP = sizeof(uint4) / y_pred.element_size();
+  dim3 block(256);
+  dim3 grid((y_pred.numel() + block.x * ILP - 1) / (block.x * ILP));
+
+  // TODO: reduce precision for label and partial grad.
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+      y_pred.scalar_type(), "focal_bce_loss_fprop", [&] {
+        using accscalar_t = at::acc_type<scalar_t, true>;
+        using labelscalar_t = float;
+        using outscalar_t = float;
+        const int ILP = sizeof(uint4) / sizeof(scalar_t);
+        focal_bce_loss_forward_cuda_kernel<ILP, scalar_t, labelscalar_t,
+                                           accscalar_t, outscalar_t>
+            <<<grid, block, 0, stream>>>(loss.data_ptr<outscalar_t>(),
+                                         partial_grad.data_ptr<outscalar_t>(),
+                                         y_pred.data_ptr<scalar_t>(),
+                                         y_true.data_ptr<labelscalar_t>(),
+                                         numel, alpha, gamma);
+      });
+
+  C10_CUDA_CHECK(cudaGetLastError());
+  return {loss, partial_grad};
+}
+
+at::Tensor focal_bce_loss_backward_cuda(const at::Tensor &grad_output,
+                                        const at::Tensor &partial_grad) {
+  // Each thread process ILP elements
+  const int ILP = sizeof(uint4) / partial_grad.element_size();
+  dim3 block(256);
+  dim3 grid((partial_grad.numel() + block.x * ILP - 1) / (block.x * ILP));
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+      partial_grad.scalar_type(), "focal_bce_loss_bprop", [&] {
+        using accscalar_t = at::acc_type<scalar_t, true>;
+        using outscalar_t = float;
+        const int ILP = sizeof(uint4) / sizeof(scalar_t);
+        focal_bce_loss_backward_cuda_kernel<ILP, scalar_t, accscalar_t,
+                                            outscalar_t>
+            <<<grid, block, 0, stream>>>(partial_grad.data_ptr<outscalar_t>(),
+                                         grad_output.data_ptr<outscalar_t>(),
                                          partial_grad.numel());
       });
 
